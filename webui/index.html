@@ -70,17 +70,14 @@ sys.path.insert(0, "/pkg")
 pyodideReady = initPyodide();
 
 const RUNNER = `
-import io, zipfile, sys, traceback
+import io, zipfile, asyncio
 from unreal.package_reader import UnrealPackage
 from unreal.static_mesh import extract_geometry
 from unreal.actors import collect_placements
 from glb.scene_writer import write_scene_glb
 
-def run(zip_bytes):
+async def run(zip_bytes, say):
     zip_bytes = bytes(zip_bytes)  # JS Uint8Array arrives as a JsProxy; needs an explicit copy to Python bytes
-    logs = []
-    def say(s):
-        logs.append(s)
 
     zin = zipfile.ZipFile(io.BytesIO(zip_bytes))
     udk_name = None
@@ -93,6 +90,7 @@ def run(zip_bytes):
         raise ValueError("No .udk/.upk file found inside the zip")
 
     say(f"Found package: {udk_name}")
+    await asyncio.sleep(0)
     raw_pkg = zin.read(udk_name)
     with open('/tmp/pkg.udk', 'wb') as f:
         f.write(raw_pkg)
@@ -100,6 +98,7 @@ def run(zip_bytes):
     pkg = UnrealPackage('/tmp/pkg.udk')
     mesh_exports = pkg.find_exports_by_class("StaticMesh")
     say(f"StaticMesh exports: {len(mesh_exports)}")
+    await asyncio.sleep(0)
 
     meshes = {}
     failed = []
@@ -114,6 +113,9 @@ def run(zip_bytes):
         except ValueError as ex:
             failed.append((e.object_name, str(ex)))
             say(f"  FAIL {e.object_name}: {ex}")
+        # yield to the browser after every mesh so the log updates live and
+        # the tab never looks frozen, even while a big mesh is still scanning
+        await asyncio.sleep(0)
 
     if not meshes:
         raise ValueError("No StaticMesh geometry could be extracted")
@@ -136,6 +138,7 @@ def run(zip_bytes):
         for mname in meshes:
             nodes.append({"name": mname, "mesh": mname, "translation": (0, 0, 0)})
 
+    await asyncio.sleep(0)
     base_name = udk_name.rsplit('/', 1)[-1]
     base_name = base_name.rsplit('.', 1)[0]
     glb_path = f"/tmp/{base_name}.glb"
@@ -151,7 +154,7 @@ def run(zip_bytes):
 
     say(f"GLB size: {len(glb_bytes)} bytes")
     say(f"meshes_ok={len(meshes)} nodes={len(nodes)} failed={len(failed)}")
-    return base_name, out_zip.getvalue(), logs
+    return base_name, out_zip.getvalue()
 `;
 
 async function handleFile(file) {
@@ -163,11 +166,9 @@ async function handleFile(file) {
   try {
     await pyodide.runPythonAsync(RUNNER);
     const run = pyodide.globals.get('run');
-    const result = run(buf);
-    const [baseName, zipBytes, logs] = result.toJs();
-    for (const line of logs) {
-      log(line, line.includes('FAIL') ? 'fail' : (line.includes('OK') ? 'ok' : 'info'));
-    }
+    const sayLine = (line) => log(line, line.includes('FAIL') ? 'fail' : (line.includes('OK') ? 'ok' : 'info'));
+    const result = await run(buf, sayLine);
+    const [baseName, zipBytes] = result.toJs();
     const blob = new Blob([new Uint8Array(zipBytes)], {type: 'application/zip'});
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');

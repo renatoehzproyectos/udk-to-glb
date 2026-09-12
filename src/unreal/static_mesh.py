@@ -340,49 +340,74 @@ def find_triangle_soup(data, scan_from, bounds, min_gap=40):
     variable-length UV/tangent/color blocks) instead of the shared
     vertex+index buffers the LOD render path uses. We can't reliably predict
     the per-triangle stride (it depends on NumUVs), so instead of assuming a
-    fixed layout we re-scan for the next valid Vertices[3] pattern after each
-    hit. Candidates are constrained to the mesh's own FBoxSphereBounds (with
-    a margin) and to non-degenerate triangle shape, which is what keeps this
-    from turning into noise on multi-megabyte exports."""
+    fixed layout we re-scan for the next valid Vertices[3] pattern anywhere in
+    the buffer. Candidates are constrained to the mesh's own FBoxSphereBounds
+    (with a margin) and to non-degenerate triangle shape, which is what keeps
+    this from turning into noise on multi-megabyte exports.
+
+    Perf note: naive byte-by-byte struct.unpack_from was ~1 python call per
+    byte (multi-minute on a 4-5MB mesh, and since this runs synchronously it
+    froze the browser tab entirely). Instead we bulk-convert each of the 4
+    possible byte alignments to a float array in one C call (array module),
+    then do a cheap first-vertex bbox check as a plain array-index compare
+    before ever touching the expensive edge/area validation.
+    """
+    from array import array as _array
+
     origin, extent, radius = bounds
     margin = 1.15
-    lo = tuple(origin[i] - extent[i] * margin for i in range(3))
-    hi = tuple(origin[i] + extent[i] * margin for i in range(3))
+    lox, loy, loz = (origin[i] - extent[i] * margin for i in range(3))
+    hix, hiy, hiz = (origin[i] + extent[i] * margin for i in range(3))
     diag = 2 * radius
     min_edge = diag * 0.01
     min_area = min_edge * min_edge * 0.1
 
-    def valid_tri(off):
-        if off + 36 > len(data):
-            return None
-        vs = []
-        for i in range(3):
-            x, y, z = struct.unpack_from("<fff", data, off + i * 12)
-            if x != x or y != y or z != z:
-                return None
-            if not (lo[0] <= x <= hi[0] and lo[1] <= y <= hi[1] and lo[2] <= z <= hi[2]):
-                return None
-            vs.append((x, y, z))
-        e1, e2, e3 = _sub(vs[1], vs[0]), _sub(vs[2], vs[0]), _sub(vs[2], vs[1])
-        if min(_norm(e1), _norm(e2), _norm(e3)) < min_edge:
-            return None
-        if _norm(_cross(e1, e2)) / 2 < min_area:
-            return None
-        return vs
+    n = len(data)
+    candidates = []  # (byte_offset, [(x,y,z)*3])
+
+    for r in range(4):
+        usable = n - r
+        nfloats = usable // 4
+        # need 9 floats (3 verts) ahead, and enough trailing bytes for min_gap
+        if nfloats < 9:
+            continue
+        floats = _array("f")
+        floats.frombytes(data[r : r + nfloats * 4])
+        last_i = nfloats - 9
+        i = 0
+        while i <= last_i:
+            x0 = floats[i]
+            if lox <= x0 <= hix:
+                y0 = floats[i + 1]
+                z0 = floats[i + 2]
+                if loy <= y0 <= hiy and loz <= z0 <= hiz:
+                    x1, y1, z1 = floats[i + 3], floats[i + 4], floats[i + 5]
+                    x2, y2, z2 = floats[i + 6], floats[i + 7], floats[i + 8]
+                    if (
+                        lox <= x1 <= hix and loy <= y1 <= hiy and loz <= z1 <= hiz
+                        and lox <= x2 <= hix and loy <= y2 <= hiy and loz <= z2 <= hiz
+                    ):
+                        v0, v1, v2 = (x0, y0, z0), (x1, y1, z1), (x2, y2, z2)
+                        e1, e2, e3 = _sub(v1, v0), _sub(v2, v0), _sub(v2, v1)
+                        if (
+                            min(_norm(e1), _norm(e2), _norm(e3)) >= min_edge
+                            and _norm(_cross(e1, e2)) / 2 >= min_area
+                        ):
+                            candidates.append((r + i * 4, [v0, v1, v2]))
+            i += 1
+
+    candidates.sort(key=lambda c: c[0])
 
     verts = []
     indices = []
-    pos = scan_from
-    n = len(data)
-    while pos < n - 36:
-        t = valid_tri(pos)
-        if t:
-            base = len(verts)
-            verts.extend(t)
-            indices.extend((base, base + 1, base + 2))
-            pos += min_gap
-        else:
-            pos += 1
+    next_ok = scan_from
+    for off, tri in candidates:
+        if off < next_ok:
+            continue
+        base = len(verts)
+        verts.extend(tri)
+        indices.extend((base, base + 1, base + 2))
+        next_ok = off + min_gap
     return verts, indices
 
 
