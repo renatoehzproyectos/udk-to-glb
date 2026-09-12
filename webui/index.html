@@ -77,6 +77,7 @@ from unreal.actors import collect_placements
 from glb.scene_writer import write_scene_glb
 
 def run(zip_bytes):
+    zip_bytes = bytes(zip_bytes)  # JS Uint8Array arrives as a JsProxy; needs an explicit copy to Python bytes
     logs = []
     def say(s):
         logs.append(s)
