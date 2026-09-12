@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RL Map → GLB (for ArcAr)</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: -apple-system, system-ui, sans-serif; background:#111418; color:#e8ecf1; margin:0; padding:24px; }
+  h1 { font-size:1.25rem; margin:0 0 4px; }
+  p.sub { color:#9aa4b2; margin:0 0 24px; font-size:.9rem; }
+  .card { background:#1a1f27; border:1px solid #2a313d; border-radius:12px; padding:20px; max-width:520px; margin:0 auto 16px; }
+  .drop { border:2px dashed #3a4453; border-radius:10px; padding:28px 16px; text-align:center; cursor:pointer; transition:.15s; }
+  .drop.drag { border-color:#5b8def; background:#161c26; }
+  .drop input { display:none; }
+  button { background:#3d6fe0; color:#fff; border:none; border-radius:8px; padding:10px 16px; font-size:.95rem; cursor:pointer; }
+  button:disabled { background:#2a313d; color:#6b7686; cursor:default; }
+  .log { background:#0c0f13; border-radius:8px; padding:12px; font-family:ui-monospace,Menlo,monospace; font-size:.78rem; white-space:pre-wrap; max-height:340px; overflow:auto; margin-top:14px; line-height:1.4; }
+  .ok { color:#5fd18a; } .fail { color:#e0665f; } .info { color:#9aa4b2; }
+  .status { font-size:.85rem; margin-top:10px; color:#9aa4b2; }
+  a.dl { display:inline-block; margin-top:14px; background:#26a65b; color:#fff; text-decoration:none; padding:10px 16px; border-radius:8px; font-weight:600; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>RL Map → GLB</h1>
+    <p class="sub">Import a BakkesMod-style map zip (.udk/.upk inside). Runs fully on-device — nothing is uploaded anywhere. Produces a zip with a ready-to-import .glb for ArcAr.</p>
+
+    <div class="drop" id="drop">
+      <div id="dropLabel">Tap to choose a map .zip<br><small style="color:#6b7686">or drag &amp; drop</small></div>
+      <input type="file" id="file" accept=".zip">
+    </div>
+
+    <div class="status" id="status">Loading Python runtime…</div>
+    <div class="log" id="log"></div>
+    <div id="dlarea"></div>
+  </div>
+
+<script src="https://cdn.jsdelivr.net/pyodide/v0.26.1/full/pyodide.js"></script>
+<script src="./_sources.js"></script>
+<script>
+const logEl = document.getElementById('log');
+const statusEl = document.getElementById('status');
+const dlarea = document.getElementById('dlarea');
+function log(msg, cls) {
+  const line = document.createElement('div');
+  if (cls) line.className = cls;
+  line.textContent = msg;
+  logEl.appendChild(line);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+let pyodideReady = null;
+async function initPyodide() {
+  const pyodide = await loadPyodide();
+  // write embedded source files into the virtual FS as a package
+  pyodide.FS.mkdirTree('/pkg/unreal');
+  pyodide.FS.mkdirTree('/pkg/glb');
+  for (const [relpath, content] of Object.entries(EMBEDDED_SOURCES)) {
+    pyodide.FS.writeFile('/pkg/' + relpath, content);
+  }
+  pyodide.FS.writeFile('/pkg/__init__.py', '');
+  await pyodide.runPythonAsync(`
+import sys
+sys.path.insert(0, "/pkg")
+`);
+  statusEl.textContent = 'Ready — choose a map zip.';
+  return pyodide;
+}
+pyodideReady = initPyodide();
+
+const RUNNER = `
+import io, zipfile, sys, traceback
+from unreal.package_reader import UnrealPackage
+from unreal.static_mesh import extract_geometry
+from unreal.actors import collect_placements
+from glb.scene_writer import write_scene_glb
+
+def run(zip_bytes):
+    logs = []
+    def say(s):
+        logs.append(s)
+
+    zin = zipfile.ZipFile(io.BytesIO(zip_bytes))
+    udk_name = None
+    for n in zin.namelist():
+        low = n.lower()
+        if low.endswith('.udk') or low.endswith('.upk'):
+            udk_name = n
+            break
+    if udk_name is None:
+        raise ValueError("No .udk/.upk file found inside the zip")
+
+    say(f"Found package: {udk_name}")
+    raw_pkg = zin.read(udk_name)
+    with open('/tmp/pkg.udk', 'wb') as f:
+        f.write(raw_pkg)
+
+    pkg = UnrealPackage('/tmp/pkg.udk')
+    mesh_exports = pkg.find_exports_by_class("StaticMesh")
+    say(f"StaticMesh exports: {len(mesh_exports)}")
+
+    meshes = {}
+    failed = []
+    for e in mesh_exports:
+        raw = pkg.raw_object_data(e)
+        try:
+            geo = extract_geometry(raw, name=e.object_name, names=pkg.names,
+                                    ar_ver=pkg.summary.version,
+                                    package_data=pkg.data, serial_offset=e.serial_offset)
+            meshes[e.object_name] = (geo.vertices, geo.indices)
+            say(f"  OK   {e.object_name}: {len(geo.vertices)} verts, {len(geo.indices)//3} tris")
+        except ValueError as ex:
+            failed.append((e.object_name, str(ex)))
+            say(f"  FAIL {e.object_name}: {ex}")
+
+    if not meshes:
+        raise ValueError("No StaticMesh geometry could be extracted")
+
+    nodes = []
+    try:
+        actors = collect_placements(pkg)
+        say(f"Actor placements: {len(actors)}")
+        used = set()
+        for a in actors:
+            if a.mesh_name and a.mesh_name in meshes:
+                nodes.append({"name": a.name, "mesh": a.mesh_name,
+                              "translation": a.location, "euler": a.rotation, "scale": a.scale})
+                used.add(a.mesh_name)
+        for mname in meshes:
+            if mname not in used:
+                nodes.append({"name": mname, "mesh": mname, "translation": (0, 0, 0)})
+    except Exception:
+        say("Actor placement parsing failed, placing meshes at origin.")
+        for mname in meshes:
+            nodes.append({"name": mname, "mesh": mname, "translation": (0, 0, 0)})
+
+    base_name = udk_name.rsplit('/', 1)[-1]
+    base_name = base_name.rsplit('.', 1)[0]
+    glb_path = f"/tmp/{base_name}.glb"
+    write_scene_glb(glb_path, meshes, nodes)
+
+    with open(glb_path, 'rb') as f:
+        glb_bytes = f.read()
+
+    out_zip = io.BytesIO()
+    with zipfile.ZipFile(out_zip, 'w', zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(f"{base_name}.glb", glb_bytes)
+    out_zip.seek(0)
+
+    say(f"GLB size: {len(glb_bytes)} bytes")
+    say(f"meshes_ok={len(meshes)} nodes={len(nodes)} failed={len(failed)}")
+    return base_name, out_zip.getvalue(), logs
+`;
+
+async function handleFile(file) {
+  logEl.innerHTML = '';
+  dlarea.innerHTML = '';
+  statusEl.textContent = 'Running extraction…';
+  const pyodide = await pyodideReady;
+  const buf = new Uint8Array(await file.arrayBuffer());
+  try {
+    await pyodide.runPythonAsync(RUNNER);
+    const run = pyodide.globals.get('run');
+    const result = run(buf);
+    const [baseName, zipBytes, logs] = result.toJs();
+    for (const line of logs) {
+      log(line, line.includes('FAIL') ? 'fail' : (line.includes('OK') ? 'ok' : 'info'));
+    }
+    const blob = new Blob([new Uint8Array(zipBytes)], {type: 'application/zip'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${baseName}_ArcAr.zip`;
+    a.className = 'dl';
+    a.textContent = `Download ${baseName}_ArcAr.zip`;
+    dlarea.appendChild(a);
+    statusEl.textContent = 'Done. Import this zip in ArcAr → Import Map.';
+  } catch (err) {
+    log(String(err), 'fail');
+    statusEl.textContent = 'Extraction failed — see log.';
+  }
+}
+
+const drop = document.getElementById('drop');
+const fileInput = document.getElementById('file');
+drop.addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', (e) => {
+  if (e.target.files[0]) handleFile(e.target.files[0]);
+});
+['dragover','dragenter'].forEach(ev => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.add('drag'); }));
+['dragleave','drop'].forEach(ev => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.remove('drag'); }));
+drop.addEventListener('drop', (e) => {
+  const f = e.dataTransfer.files[0];
+  if (f) handleFile(f);
+});
+</script>
+</body>
+</html>
