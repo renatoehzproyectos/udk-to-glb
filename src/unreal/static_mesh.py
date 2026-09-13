@@ -403,7 +403,7 @@ def find_loose(data):
 
 def find_bounds(data, limit=400_000):
     """Locate a usable bounding box for this mesh, so find_triangle_soup has
-    something to anchor its scan to. Two fingerprints are tried:
+    something to anchor its scan to. Three fingerprints are tried, in order:
 
     1) FBoxSphereBounds (Origin, BoxExtent, SphereRadius) — the common case.
        SphereRadius must equal |BoxExtent| (within tolerance); this is a
@@ -414,11 +414,19 @@ def find_bounds(data, limit=400_000):
        Max > Min box with at least two axes of real size is accepted; among
        candidates we prefer the largest footprint, since real bounds tend to
        dwarf coincidental float matches.
+    3) A percentile-based estimate (1st-99th percentile spread of plausible
+       float3 samples in the buffer) — last resort when neither struct
+       fingerprint is present at all. Fuzzier, but better than nothing.
 
-    Both scans check every byte offset (fields aren't guaranteed 4-byte
-    aligned in this format), so — same as find_triangle_soup — we bulk
-    convert each of the 4 byte alignments to a float array once instead of
-    calling struct.unpack_from per byte.
+    IMPORTANT: fingerprints (1) and (2) are NOT cross-validated against (3).
+    An earlier attempt at that (rejecting a fingerprint match that seemed
+    inconsistent with the percentile estimate) caused severe regressions —
+    it rejected genuinely correct matches on other meshes it had no business
+    touching. (3) only ever runs when (1) and (2) both find nothing.
+
+    All three scans check every byte offset (fields aren't guaranteed 4-byte
+    aligned in this format), so we bulk convert each of the 4 byte alignments
+    to a float array once instead of calling struct.unpack_from per byte.
     """
     from array import array as _array
 
@@ -477,7 +485,55 @@ def find_bounds(data, limit=400_000):
                 radius = (ex * ex + ey * ey + ez * ez) ** 0.5
                 best = (origin, extent, radius)
                 best_area = area
-    return best
+    if best:
+        return best
+
+    # Last resort: neither an FBoxSphereBounds nor a plain FBox fingerprint
+    # was found. Rather than give up, derive an approximate bounding box from
+    # the 1st-99th percentile spread of every plausible, bounded,
+    # non-degenerate float3 in the buffer. Fuzzier than a real Bounds struct,
+    # but on real geometry data the actual vertex coordinates dominate that
+    # distribution — verified against a real custom mesh where this
+    # recovered a sane, correctly proportioned result matching its sibling
+    # mesh's scale. Only ever reached when both fingerprints above found
+    # nothing at all — it does not second-guess a fingerprint match.
+    n3 = min(len(data), limit)
+
+    def _ok(v):
+        return -1e5 < v < 1e5 and v == v and (v == 0 or abs(v) > 1e-3)
+
+    samples_x, samples_y, samples_z = [], [], []
+    for r in range(4):
+        usable = n3 - r
+        nfloats = usable // 4
+        if nfloats < 3:
+            continue
+        floats = _array("f")
+        floats.frombytes(data[r : r + nfloats * 4])
+        for i in range(0, nfloats - 2):
+            x, y, z = floats[i], floats[i + 1], floats[i + 2]
+            if _ok(x) and _ok(y) and _ok(z) and (abs(x) > 1 or abs(y) > 1 or abs(z) > 1):
+                samples_x.append(x)
+                samples_y.append(y)
+                samples_z.append(z)
+    if len(samples_x) < 50:
+        return None
+    samples_x.sort()
+    samples_y.sort()
+    samples_z.sort()
+
+    def pct(a, p):
+        return a[max(0, min(len(a) - 1, int(len(a) * p)))]
+
+    lo = (pct(samples_x, 0.01), pct(samples_y, 0.01), pct(samples_z, 0.01))
+    hi = (pct(samples_x, 0.99), pct(samples_y, 0.99), pct(samples_z, 0.99))
+    dims = tuple(hi[i] - lo[i] for i in range(3))
+    if max(dims) < 10:
+        return None
+    origin = tuple((lo[i] + hi[i]) / 2 for i in range(3))
+    extent = tuple(max(dims[i] / 2, 1.0) for i in range(3))
+    radius = sum(e * e for e in extent) ** 0.5
+    return origin, extent, radius
 
 
 def _sub(a, b):

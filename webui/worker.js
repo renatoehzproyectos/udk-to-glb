@@ -29,13 +29,14 @@ sys.path.insert(0, "/pkg")
 }
 
 const RUNNER = `
-import io, zipfile, asyncio
+import io, zipfile, asyncio, json
 from unreal.package_reader import UnrealPackage
 from unreal.static_mesh import extract_geometry
 from unreal.actors import collect_placements
+from unreal.inventory import build_manifest
 from glb.scene_writer import write_scene_glb
 
-async def run(zip_bytes, say):
+async def run(zip_bytes, say, progress):
     zip_bytes = bytes(zip_bytes)  # JS Uint8Array arrives as a JsProxy; needs an explicit copy to Python bytes
 
     zin = zipfile.ZipFile(io.BytesIO(zip_bytes))
@@ -61,7 +62,9 @@ async def run(zip_bytes, say):
 
     meshes = {}
     failed = []
-    for e in mesh_exports:
+    total = len(mesh_exports)
+    for i, e in enumerate(mesh_exports):
+        progress(i, total, e.object_name)
         raw = pkg.raw_object_data(e)
         try:
             geo = extract_geometry(raw, name=e.object_name, names=pkg.names,
@@ -74,6 +77,7 @@ async def run(zip_bytes, say):
             failed.append((e.object_name, str(ex)))
             say(f"  FAIL {e.object_name}: {ex}")
         await asyncio.sleep(0)
+    progress(total, total, "")
 
     if not meshes:
         raise ValueError("No StaticMesh geometry could be extracted")
@@ -99,8 +103,40 @@ async def run(zip_bytes, say):
     await asyncio.sleep(0)
     base_name = udk_name.rsplit('/', 1)[-1]
     base_name = base_name.rsplit('.', 1)[0]
+
+    say("Reading everything else in the package (lights, spawn points, goals, boost pads, materials)...")
+    try:
+        manifest = build_manifest(pkg)
+        say(f"  found {len(manifest['lights'])} lights, "
+            f"{sum(len(v) for v in manifest['gameplay_actors'].values())} gameplay actors, "
+            f"{len(manifest['materials'])} materials, "
+            f"{len(manifest['exports'])} total objects in the package")
+    except Exception as ex:
+        manifest = None
+        say(f"  manifest extraction failed (non-fatal): {ex}")
+    await asyncio.sleep(0)
+
+    lights_gltf = []
+    if manifest:
+        for i, l in enumerate(manifest["lights"]):
+            lights_gltf.append({"name": l["name"], "type": l["type"],
+                                 "color": l["color"], "intensity": l["intensity"]})
+            nodes.append({
+                "name": f"Light_{l['name']}_{i}",
+                "translation": l["location"],
+                "euler": l["rotation"],
+                "light": i,
+            })
+        for category, actors in manifest["gameplay_actors"].items():
+            for a in actors:
+                nodes.append({
+                    "name": f"{category}_{a['name']}",
+                    "translation": a["location"],
+                    "euler": a["rotation"],
+                })
+
     glb_path = f"/tmp/{base_name}.glb"
-    write_scene_glb(glb_path, meshes, nodes)
+    write_scene_glb(glb_path, meshes, nodes, lights=lights_gltf)
 
     with open(glb_path, 'rb') as f:
         glb_bytes = f.read()
@@ -108,6 +144,8 @@ async def run(zip_bytes, say):
     out_zip = io.BytesIO()
     with zipfile.ZipFile(out_zip, 'w', zipfile.ZIP_DEFLATED) as zf:
         zf.writestr(f"{base_name}.glb", glb_bytes)
+        if manifest:
+            zf.writestr(f"{base_name}_manifest.json", json.dumps(manifest, indent=2))
     out_zip.seek(0)
 
     say(f"GLB size: {len(glb_bytes)} bytes")
@@ -123,7 +161,9 @@ self.onmessage = async (event) => {
     await pyodide.runPythonAsync(RUNNER);
     const run = pyodide.globals.get("run");
     const sayLine = (line) => self.postMessage({ type: "log", line });
-    const result = await run(zipBytes, sayLine);
+    const progress = (current, total, meshName) =>
+      self.postMessage({ type: "progress", current, total, meshName });
+    const result = await run(zipBytes, sayLine, progress);
     const [baseName, outZipBytes] = result.toJs();
     const bytes = new Uint8Array(outZipBytes);
     self.postMessage({ type: "done", baseName, zipBytes: bytes }, [bytes.buffer]);

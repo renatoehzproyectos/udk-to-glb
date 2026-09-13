@@ -20,6 +20,10 @@
   .status { font-size:.85rem; margin-top:10px; color:#9aa4b2; }
   a.dl { display:inline-block; margin-top:14px; background:#26a65b; color:#fff; text-decoration:none; padding:10px 16px; border-radius:8px; font-weight:600; }
   .hint { font-size:.75rem; color:#6b7686; margin-top:10px; }
+  .progress-wrap { margin-top:10px; }
+  .progress-bar { background:#0c0f13; border-radius:6px; height:10px; overflow:hidden; }
+  .progress-fill { background:#3d6fe0; height:100%; width:0%; transition:width .15s ease; }
+  .progress-label { font-size:.75rem; color:#9aa4b2; margin-top:5px; display:flex; justify-content:space-between; }
 </style>
 </head>
 <body>
@@ -33,6 +37,10 @@
     </div>
 
     <div class="status" id="status">Loading Python runtime…</div>
+    <div class="progress-wrap" id="progressWrap" style="display:none">
+      <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+      <div class="progress-label" id="progressLabel"></div>
+    </div>
     <div class="log" id="log"></div>
     <div id="dlarea"></div>
     <p class="hint">Extraction runs in a background worker, so the page stays scrollable/responsive even during a big map. You can lock your phone or switch tabs — it keeps running.</p>
@@ -65,7 +73,19 @@ worker.onmessage = (e) => {
     statusEl.textContent = 'Ready — choose a map zip.';
   } else if (msg.type === 'log') {
     log(msg.line, classifyLine(msg.line));
+  } else if (msg.type === 'progress') {
+    const wrap = document.getElementById('progressWrap');
+    const fill = document.getElementById('progressFill');
+    const label = document.getElementById('progressLabel');
+    if (msg.total > 0) {
+      wrap.style.display = 'block';
+      const pct = Math.round((msg.current / msg.total) * 100);
+      fill.style.width = pct + '%';
+      label.innerHTML = `<span>${msg.meshName || 'Finishing up…'}</span><span>${msg.current}/${msg.total} · ${pct}%</span>`;
+    }
   } else if (msg.type === 'done') {
+    document.getElementById('progressFill').style.width = '100%';
+    document.getElementById('progressLabel').innerHTML = `<span>Done</span><span>100%</span>`;
     const blob = new Blob([msg.zipBytes], { type: 'application/zip' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -95,6 +115,8 @@ async function handleFile(file) {
   busy = true;
   logEl.innerHTML = '';
   dlarea.innerHTML = '';
+  document.getElementById('progressWrap').style.display = 'none';
+  document.getElementById('progressFill').style.width = '0%';
   statusEl.textContent = 'Running extraction… (page stays usable — this runs in the background)';
   const buf = new Uint8Array(await file.arrayBuffer());
   worker.postMessage({ zipBytes: buf }, [buf.buffer]);

@@ -39,14 +39,19 @@ def write_scene_glb(
     path: str,
     meshes: Dict[str, Tuple[Sequence[Tuple[float, float, float]], Sequence[int]]],
     nodes: List[Dict[str, Any]],
+    lights: List[Dict[str, Any]] = None,
 ) -> None:
     """
     meshes: name -> (vertices, indices)
-    nodes: list of {name, mesh, translation, rotation, scale}
+    nodes: list of {name, mesh, translation, rotation, scale, light}
       rotation as quaternion (x,y,z,w) or euler degrees under 'euler'
+      'light': index into `lights`, for non-mesh light marker nodes
+    lights: list of {name, type: 'directional'|'point'|'spot', color: (r,g,b) 0-1,
+                     intensity}. Written as glTF KHR_lights_punctual.
     """
     if not meshes:
         raise ValueError("No meshes to write")
+    lights = lights or []
 
     bin_parts = []
     accessors = []
@@ -118,6 +123,8 @@ def write_scene_glb(
         elif "euler" in n:
             e = n["euler"]
             node["rotation"] = list(_euler_unreal_to_quat(e[0], e[1], e[2]))
+        if "light" in n:
+            node["extensions"] = {"KHR_lights_punctual": {"light": n["light"]}}
         gltf_nodes.append(node)
         root_children.append(len(gltf_nodes) - 1)
 
@@ -132,6 +139,21 @@ def write_scene_glb(
         "scenes": [{"nodes": root_children}],
         "scene": 0,
     }
+    if lights:
+        gltf["extensionsUsed"] = ["KHR_lights_punctual"]
+        gltf["extensions"] = {
+            "KHR_lights_punctual": {
+                "lights": [
+                    {
+                        "name": l.get("name", "light"),
+                        "type": l.get("type", "point"),
+                        "color": list(l.get("color", (1.0, 1.0, 1.0))),
+                        "intensity": l.get("intensity", 1.0),
+                    }
+                    for l in lights
+                ]
+            }
+        }
 
     json_bytes = json.dumps(gltf, separators=(",", ":")).encode("utf-8")
     json_pad = b" " * (_align4(len(json_bytes)) - len(json_bytes))
