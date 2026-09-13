@@ -16,9 +16,10 @@
   button { background:#3d6fe0; color:#fff; border:none; border-radius:8px; padding:10px 16px; font-size:.95rem; cursor:pointer; }
   button:disabled { background:#2a313d; color:#6b7686; cursor:default; }
   .log { background:#0c0f13; border-radius:8px; padding:12px; font-family:ui-monospace,Menlo,monospace; font-size:.78rem; white-space:pre-wrap; max-height:340px; overflow:auto; margin-top:14px; line-height:1.4; }
-  .ok { color:#5fd18a; } .fail { color:#e0665f; } .info { color:#9aa4b2; }
+  .ok { color:#5fd18a; } .fail { color:#e0665f; } .info { color:#9aa4b2; } .warn { color:#e0b85f; }
   .status { font-size:.85rem; margin-top:10px; color:#9aa4b2; }
   a.dl { display:inline-block; margin-top:14px; background:#26a65b; color:#fff; text-decoration:none; padding:10px 16px; border-radius:8px; font-weight:600; }
+  .hint { font-size:.75rem; color:#6b7686; margin-top:10px; }
 </style>
 </head>
 <body>
@@ -34,10 +35,9 @@
     <div class="status" id="status">Loading Python runtime…</div>
     <div class="log" id="log"></div>
     <div id="dlarea"></div>
+    <p class="hint">Extraction runs in a background worker, so the page stays scrollable/responsive even during a big map. You can lock your phone or switch tabs — it keeps running.</p>
   </div>
 
-<script src="https://cdn.jsdelivr.net/pyodide/v0.26.1/full/pyodide.js"></script>
-<script src="./_sources.js"></script>
 <script>
 const logEl = document.getElementById('log');
 const statusEl = document.getElementById('status');
@@ -49,139 +49,55 @@ function log(msg, cls) {
   logEl.appendChild(line);
   logEl.scrollTop = logEl.scrollHeight;
 }
-
-let pyodideReady = null;
-async function initPyodide() {
-  const pyodide = await loadPyodide();
-  // write embedded source files into the virtual FS as a package
-  pyodide.FS.mkdirTree('/pkg/unreal');
-  pyodide.FS.mkdirTree('/pkg/glb');
-  for (const [relpath, content] of Object.entries(EMBEDDED_SOURCES)) {
-    pyodide.FS.writeFile('/pkg/' + relpath, content);
-  }
-  pyodide.FS.writeFile('/pkg/__init__.py', '');
-  await pyodide.runPythonAsync(`
-import sys
-sys.path.insert(0, "/pkg")
-`);
-  statusEl.textContent = 'Ready — choose a map zip.';
-  return pyodide;
+function classifyLine(line) {
+  if (line.includes('FAIL')) return 'fail';
+  if (line.includes('LOWCONF')) return 'warn';
+  if (line.includes('OK')) return 'ok';
+  return 'info';
 }
-pyodideReady = initPyodide();
 
-const RUNNER = `
-import io, zipfile, asyncio
-from unreal.package_reader import UnrealPackage
-from unreal.static_mesh import extract_geometry
-from unreal.actors import collect_placements
-from glb.scene_writer import write_scene_glb
+const worker = new Worker('./worker.js');
+let busy = false;
 
-async def run(zip_bytes, say):
-    zip_bytes = bytes(zip_bytes)  # JS Uint8Array arrives as a JsProxy; needs an explicit copy to Python bytes
-
-    zin = zipfile.ZipFile(io.BytesIO(zip_bytes))
-    udk_name = None
-    for n in zin.namelist():
-        low = n.lower()
-        if low.endswith('.udk') or low.endswith('.upk'):
-            udk_name = n
-            break
-    if udk_name is None:
-        raise ValueError("No .udk/.upk file found inside the zip")
-
-    say(f"Found package: {udk_name}")
-    await asyncio.sleep(0)
-    raw_pkg = zin.read(udk_name)
-    with open('/tmp/pkg.udk', 'wb') as f:
-        f.write(raw_pkg)
-
-    pkg = UnrealPackage('/tmp/pkg.udk')
-    mesh_exports = pkg.find_exports_by_class("StaticMesh")
-    say(f"StaticMesh exports: {len(mesh_exports)}")
-    await asyncio.sleep(0)
-
-    meshes = {}
-    failed = []
-    for e in mesh_exports:
-        raw = pkg.raw_object_data(e)
-        try:
-            geo = extract_geometry(raw, name=e.object_name, names=pkg.names,
-                                    ar_ver=pkg.summary.version,
-                                    package_data=pkg.data, serial_offset=e.serial_offset)
-            meshes[e.object_name] = (geo.vertices, geo.indices)
-            say(f"  OK   {e.object_name}: {len(geo.vertices)} verts, {len(geo.indices)//3} tris")
-        except ValueError as ex:
-            failed.append((e.object_name, str(ex)))
-            say(f"  FAIL {e.object_name}: {ex}")
-        # yield to the browser after every mesh so the log updates live and
-        # the tab never looks frozen, even while a big mesh is still scanning
-        await asyncio.sleep(0)
-
-    if not meshes:
-        raise ValueError("No StaticMesh geometry could be extracted")
-
-    nodes = []
-    try:
-        actors = collect_placements(pkg)
-        say(f"Actor placements: {len(actors)}")
-        used = set()
-        for a in actors:
-            if a.mesh_name and a.mesh_name in meshes:
-                nodes.append({"name": a.name, "mesh": a.mesh_name,
-                              "translation": a.location, "euler": a.rotation, "scale": a.scale})
-                used.add(a.mesh_name)
-        for mname in meshes:
-            if mname not in used:
-                nodes.append({"name": mname, "mesh": mname, "translation": (0, 0, 0)})
-    except Exception:
-        say("Actor placement parsing failed, placing meshes at origin.")
-        for mname in meshes:
-            nodes.append({"name": mname, "mesh": mname, "translation": (0, 0, 0)})
-
-    await asyncio.sleep(0)
-    base_name = udk_name.rsplit('/', 1)[-1]
-    base_name = base_name.rsplit('.', 1)[0]
-    glb_path = f"/tmp/{base_name}.glb"
-    write_scene_glb(glb_path, meshes, nodes)
-
-    with open(glb_path, 'rb') as f:
-        glb_bytes = f.read()
-
-    out_zip = io.BytesIO()
-    with zipfile.ZipFile(out_zip, 'w', zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr(f"{base_name}.glb", glb_bytes)
-    out_zip.seek(0)
-
-    say(f"GLB size: {len(glb_bytes)} bytes")
-    say(f"meshes_ok={len(meshes)} nodes={len(nodes)} failed={len(failed)}")
-    return base_name, out_zip.getvalue()
-`;
-
-async function handleFile(file) {
-  logEl.innerHTML = '';
-  dlarea.innerHTML = '';
-  statusEl.textContent = 'Running extraction…';
-  const pyodide = await pyodideReady;
-  const buf = new Uint8Array(await file.arrayBuffer());
-  try {
-    await pyodide.runPythonAsync(RUNNER);
-    const run = pyodide.globals.get('run');
-    const sayLine = (line) => log(line, line.includes('FAIL') ? 'fail' : (line.includes('OK') ? 'ok' : 'info'));
-    const result = await run(buf, sayLine);
-    const [baseName, zipBytes] = result.toJs();
-    const blob = new Blob([new Uint8Array(zipBytes)], {type: 'application/zip'});
+worker.onmessage = (e) => {
+  const msg = e.data;
+  if (msg.type === 'ready') {
+    statusEl.textContent = 'Ready — choose a map zip.';
+  } else if (msg.type === 'log') {
+    log(msg.line, classifyLine(msg.line));
+  } else if (msg.type === 'done') {
+    const blob = new Blob([msg.zipBytes], { type: 'application/zip' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `${baseName}_ArcAr.zip`;
+    a.download = `${msg.baseName}_ArcAr.zip`;
     a.className = 'dl';
-    a.textContent = `Download ${baseName}_ArcAr.zip`;
+    a.textContent = `Download ${msg.baseName}_ArcAr.zip`;
     dlarea.appendChild(a);
     statusEl.textContent = 'Done. Import this zip in ArcAr → Import Map.';
-  } catch (err) {
-    log(String(err), 'fail');
+    busy = false;
+  } else if (msg.type === 'error') {
+    log(msg.message, 'fail');
     statusEl.textContent = 'Extraction failed — see log.';
+    busy = false;
   }
+};
+worker.onerror = (e) => {
+  log(String(e.message || e), 'fail');
+  statusEl.textContent = 'Worker error — see log.';
+  busy = false;
+};
+
+statusEl.textContent = 'Loading Python runtime… (first load only)';
+
+async function handleFile(file) {
+  if (busy) return;
+  busy = true;
+  logEl.innerHTML = '';
+  dlarea.innerHTML = '';
+  statusEl.textContent = 'Running extraction… (page stays usable — this runs in the background)';
+  const buf = new Uint8Array(await file.arrayBuffer());
+  worker.postMessage({ zipBytes: buf }, [buf.buffer]);
 }
 
 const drop = document.getElementById('drop');
