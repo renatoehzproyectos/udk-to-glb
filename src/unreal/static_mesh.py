@@ -35,10 +35,20 @@ def _f_ok(x, y, z, lim=1e7):
     return True
 
 
-def _read_f3(data, off, count, stride=12):
+def _read_f3(data, off, count, stride=12, floats=None):
+    """floats, if given, is a pre-converted `array('f')` view of the whole
+    buffer at 4-byte alignment (residue 0) — used by find_loose, where every
+    offset it calls with is guaranteed 4-aligned (stride 12 keeps every
+    subsequent vertex 4-aligned too). Turns what used to be up to 24 sample
+    reads plus a full per-vertex read, each a fresh struct.unpack_from call,
+    into array indexing — the dominant cost when find_loose has to evaluate
+    thousands of candidate positions on a multi-megabyte mesh."""
     need = count * stride
     if count < 3 or count > 1_500_000 or off + need > len(data):
         return None
+    use_fast = floats is not None and stride == 12 and off % 4 == 0
+    base = off // 4 if use_fast else 0
+
     # Broad, cheap pre-check (up to 24 evenly-spaced samples) before ever
     # committing to a full read. A full read of up to 1.5M verts is
     # expensive, and on a multi-megabyte buffer, many coincidental byte
@@ -47,11 +57,28 @@ def _read_f3(data, off, count, stride=12):
     # turn out to be false positives.
     nsamples = min(24, count)
     step = max(1, count // nsamples)
-    for i in range(0, count, step):
-        x, y, z = struct.unpack_from("<fff", data, off + i * stride)
-        if not _f_ok(x, y, z):
-            return None
-    if stride == 12:
+    if use_fast:
+        n = len(floats)
+        for i in range(0, count, step):
+            k = base + i * 3
+            if k + 2 >= n:
+                return None
+            x, y, z = floats[k], floats[k + 1], floats[k + 2]
+            if not _f_ok(x, y, z):
+                return None
+    else:
+        for i in range(0, count, step):
+            x, y, z = struct.unpack_from("<fff", data, off + i * stride)
+            if not _f_ok(x, y, z):
+                return None
+
+    if use_fast:
+        flat = floats[base : base + count * 3]
+        for v in flat:
+            if v != v or abs(v) > 1e7:
+                return None
+        verts = list(zip(flat[0::3], flat[1::3], flat[2::3]))
+    elif stride == 12:
         # Contiguous floats: one bulk C-level conversion instead of a
         # per-vertex struct.unpack_from call.
         flat = struct.unpack_from(f"<{count * 3}f", data, off)
@@ -152,17 +179,17 @@ def parse_vs_classic(data, start):
     return None
 
 
-def parse_bulk_f3(data, start, max_count=400000):
+def parse_bulk_f3(data, start, max_count=400000, floats=None):
     if start + 8 <= len(data):
         esize, count = struct.unpack_from("<ii", data, start)
         if esize == 12 and 8 <= count <= max_count and start + 8 + count * 12 <= len(data):
-            verts = _read_f3(data, start + 8, count, 12)
+            verts = _read_f3(data, start + 8, count, 12, floats)
             if verts:
                 return verts, start + 8 + count * 12, f"rawBulkB n={count}"
     if start + 4 <= len(data):
         count = struct.unpack_from("<i", data, start)[0]
         if 8 <= count <= max_count and start + 4 + count * 12 <= len(data):
-            verts = _read_f3(data, start + 4, count, 12)
+            verts = _read_f3(data, start + 4, count, 12, floats)
             if verts:
                 return verts, start + 4 + count * 12, f"rawBulkA n={count}"
     return None
@@ -344,6 +371,8 @@ def find_loose(data):
     ints = _array("i")
     ints.frombytes(data[: nints * 4])
     end_idx = min(end // 4, len(ints))
+    floats = _array("f")
+    floats.frombytes(data[: nints * 4])
 
     cands = []
     for i in range(0, end_idx):
@@ -352,11 +381,11 @@ def find_loose(data):
         if v == 12 and pos + 8 < end:
             c = ints[i + 1] if i + 1 < len(ints) else struct.unpack_from("<i", data, pos + 4)[0]
             if 8 <= c <= 300000:
-                r = parse_bulk_f3(data, pos)
+                r = parse_bulk_f3(data, pos, floats=floats)
                 if r:
                     cands.append((pos, r))
         elif 8 <= v <= 300000:
-            r = parse_bulk_f3(data, pos)
+            r = parse_bulk_f3(data, pos, floats=floats)
             if r:
                 cands.append((pos, r))
         if len(cands) > 60:
