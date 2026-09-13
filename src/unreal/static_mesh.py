@@ -39,16 +39,33 @@ def _read_f3(data, off, count, stride=12):
     need = count * stride
     if count < 3 or count > 1_500_000 or off + need > len(data):
         return None
-    for i in (0, count // 2, count - 1):
+    # Broad, cheap pre-check (up to 24 evenly-spaced samples) before ever
+    # committing to a full read. A full read of up to 1.5M verts is
+    # expensive, and on a multi-megabyte buffer, many coincidental byte
+    # patterns pass a weak 3-point check but fail a broader one — this is
+    # what keeps find_loose from doing dozens of full-cost reads that all
+    # turn out to be false positives.
+    nsamples = min(24, count)
+    step = max(1, count // nsamples)
+    for i in range(0, count, step):
         x, y, z = struct.unpack_from("<fff", data, off + i * stride)
         if not _f_ok(x, y, z):
             return None
-    verts = []
-    for i in range(count):
-        x, y, z = struct.unpack_from("<fff", data, off + i * stride)
-        if not _f_ok(x, y, z):
-            return None
-        verts.append((x, y, z))
+    if stride == 12:
+        # Contiguous floats: one bulk C-level conversion instead of a
+        # per-vertex struct.unpack_from call.
+        flat = struct.unpack_from(f"<{count * 3}f", data, off)
+        for v in flat:
+            if v != v or abs(v) > 1e7:
+                return None
+        verts = list(zip(flat[0::3], flat[1::3], flat[2::3]))
+    else:
+        verts = []
+        for i in range(count):
+            x, y, z = struct.unpack_from("<fff", data, off + i * stride)
+            if not _f_ok(x, y, z):
+                return None
+            verts.append((x, y, z))
     if count >= 6:
         xs = [v[0] for v in verts]
         ys = [v[1] for v in verts]
@@ -151,9 +168,20 @@ def parse_bulk_f3(data, start, max_count=400000):
     return None
 
 
-def try_index_buffer(data, start, max_index):
+def try_index_buffer(data, start, max_index, ints=None, ints_residue=0):
+    """ints, if given, is a pre-converted `array('i')` view of `data` at byte
+    offset `ints_residue` (see find_ib) — lets the very-hot header-count read
+    be an array index instead of a fresh struct.unpack_from call for every
+    4-byte step of a multi-megabyte buffer."""
     if start + 4 > len(data) or max_index < 2:
         return None
+
+    def read_i32(off):
+        if ints is not None and off >= ints_residue and (off - ints_residue) % 4 == 0:
+            idx = (off - ints_residue) // 4
+            if idx < len(ints):
+                return ints[idx]
+        return struct.unpack_from("<i", data, off)[0]
 
     def u16(o, count):
         if count < 3 or count % 3 or count > 3_000_000 or o + count * 2 > len(data):
@@ -181,7 +209,7 @@ def try_index_buffer(data, start, max_index):
         off = start + hdr
         if off + 4 > len(data):
             continue
-        count = struct.unpack_from("<i", data, off)[0]
+        count = read_i32(off)
         r = u16(off + 4, count)
         if r:
             return r[0], r[1], f"IB u16 n={count} hdr={hdr}"
@@ -190,7 +218,7 @@ def try_index_buffer(data, start, max_index):
             return r[0], r[1], f"IB u32 n={count} hdr={hdr}"
 
     if start + 8 <= len(data):
-        esize, count = struct.unpack_from("<ii", data, start)
+        esize, count = read_i32(start), read_i32(start + 4)
         if esize == 2:
             r = u16(start + 8, count)
             if r:
@@ -228,54 +256,101 @@ def try_skip_uv(data, start, nverts):
     return None
 
 
-def find_ib(data, verts_end, nverts, max_index):
+def find_ib(data, verts_end, nverts, max_index, max_scan=2_000_000):
+    """Scans for the index buffer following the vertex buffer. The header
+    check at each 4-byte step used to be a fresh struct.unpack_from call —
+    across a multi-megabyte remainder that's millions of Python-level calls.
+    We now bulk-convert the whole remainder to an int32 array once (one C
+    call via the array module) and index into it instead.
+
+    max_scan bounds the worst case: a real index buffer normally follows the
+    vertex buffer closely, not megabytes away, so if nothing turns up within
+    a reasonable window we give up rather than scanning the entire remainder
+    of a multi-megabyte export for a match that (empirically) isn't there."""
+    from array import array as _array
+
     search = verts_end
     for d in range(0, 256, 4):
         sk = try_skip_uv(data, verts_end + d, nverts)
         if sk:
             search = sk
             break
-    end = len(data) - 8
-    # full remainder, step 4
-    for start in range(search, end, 4):
-        r = try_index_buffer(data, start, max_index)
-        if r:
-            return r
-    if search != verts_end:
-        for start in range(verts_end, end, 4):
-            r = try_index_buffer(data, start, max_index)
+    end = min(len(data) - 8, search + max_scan)
+
+    def scan_from(lo):
+        hi = min(len(data) - 8, lo + max_scan)
+        if lo >= hi:
+            return None
+        residue = lo % 4
+        nints = (len(data) - residue) // 4
+        if nints <= 0:
+            return None
+        ints = _array("i")
+        ints.frombytes(data[residue : residue + nints * 4])
+        start = lo
+        while start < hi:
+            r = try_index_buffer(data, start, max_index, ints, residue)
             if r:
                 return r
-    return None
+            start += 4
+        return None
+
+    best = scan_from(search)
+    if best is None and search != verts_end:
+        best = scan_from(verts_end)
+    return best
 
 
 def find_best_vs(data, scan_from=0):
+    """Scans for a plausible vertex-buffer header (vsize in a small known
+    set). Bulk-converts the buffer to an int32 array once instead of one
+    struct.unpack_from call per 4-byte step — same rationale as find_ib."""
+    from array import array as _array
+
     best = None
     end = len(data) - 16
-    for pos in range(scan_from & ~3, end, 4):
-        vs = struct.unpack_from("<i", data, pos)[0]
-        if vs not in (12, 16, 8, 6):
-            continue
-        r = parse_vs_classic(data, pos)
-        if r and (best is None or len(r[0]) > len(best[0])):
-            best = (r[0], r[1], r[2], pos)
-    if best is None and scan_from > 0:
-        for pos in range(0, min(scan_from, end), 4):
-            if struct.unpack_from("<i", data, pos)[0] not in (12, 16, 8, 6):
+    if end <= 0:
+        return None
+    nints = len(data) // 4
+    ints = _array("i")
+    ints.frombytes(data[: nints * 4])
+
+    def scan(lo, hi):
+        nonlocal best
+        start_idx = (lo & ~3) // 4
+        end_idx = min(hi // 4, len(ints))
+        for i in range(start_idx, end_idx):
+            vs = ints[i]
+            if vs not in (12, 16, 8, 6):
                 continue
+            pos = i * 4
             r = parse_vs_classic(data, pos)
             if r and (best is None or len(r[0]) > len(best[0])):
                 best = (r[0], r[1], r[2], pos)
+
+    scan(scan_from, end)
+    if best is None and scan_from > 0:
+        scan(0, min(scan_from, end))
     return best
 
 
 def find_loose(data):
+    from array import array as _array
+
     end = len(data) - 16
+    if end <= 0:
+        return None
+    nints = len(data) // 4
+    ints = _array("i")
+    ints.frombytes(data[: nints * 4])
+    end_idx = min(end // 4, len(ints))
+
     cands = []
-    for pos in range(0, end, 4):
-        v = struct.unpack_from("<i", data, pos)[0]
+    for i in range(0, end_idx):
+        v = ints[i]
+        pos = i * 4
         if v == 12 and pos + 8 < end:
-            c = struct.unpack_from("<i", data, pos + 4)[0]
+            c = ints[i + 1] if i + 1 < len(ints) else struct.unpack_from("<i", data, pos + 4)[0]
             if 8 <= c <= 300000:
                 r = parse_bulk_f3(data, pos)
                 if r:
@@ -288,7 +363,7 @@ def find_loose(data):
             cands.sort(key=lambda x: -len(x[1][0]))
             cands = cands[:30]
     cands.sort(key=lambda x: -len(x[1][0]))
-    for pos, (verts, vend, note) in cands:
+    for pos, (verts, vend, note) in cands[:3]:
         if len(verts) < 8:
             continue
         ib = find_ib(data, vend, len(verts), len(verts) - 1)
@@ -298,28 +373,82 @@ def find_loose(data):
 
 
 def find_bounds(data, limit=400_000):
-    """Locate the native FBoxSphereBounds (Origin, BoxExtent, SphereRadius)
-    written right after tagged properties. Fingerprint: SphereRadius must
-    equal |BoxExtent| (within tolerance), and BoxExtent must be a real,
-    non-degenerate size (rules out coincidental float matches)."""
+    """Locate a usable bounding box for this mesh, so find_triangle_soup has
+    something to anchor its scan to. Two fingerprints are tried:
+
+    1) FBoxSphereBounds (Origin, BoxExtent, SphereRadius) — the common case.
+       SphereRadius must equal |BoxExtent| (within tolerance); this is a
+       strong signature that rules out coincidental float matches.
+    2) Plain FBox (Min, Max) — some custom meshes (seen on flat, custom
+       "Ground"-style props with near-zero thickness on one axis) don't carry
+       the sphere-bounds struct at all, or it doesn't pass check (1). Any
+       Max > Min box with at least two axes of real size is accepted; among
+       candidates we prefer the largest footprint, since real bounds tend to
+       dwarf coincidental float matches.
+
+    Both scans check every byte offset (fields aren't guaranteed 4-byte
+    aligned in this format), so — same as find_triangle_soup — we bulk
+    convert each of the 4 byte alignments to a float array once instead of
+    calling struct.unpack_from per byte.
+    """
+    from array import array as _array
+
     n = min(len(data) - 28, limit)
-    for off in range(0, max(n, 0)):
-        vals = struct.unpack_from("<fffffff", data, off)
-        ox, oy, oz, ex, ey, ez, r = vals
-        if any(v != v for v in vals):
+    for r in range(4):
+        usable = max(n, 0) - r
+        nfloats = usable // 4
+        if nfloats < 7:
             continue
-        if ex < 1.0 or ey < 1.0 or ez < 1.0:
+        floats = _array("f")
+        floats.frombytes(data[r : r + nfloats * 4])
+        last_i = nfloats - 7
+        for i in range(0, last_i + 1):
+            ex, ey, ez = floats[i + 3], floats[i + 4], floats[i + 5]
+            if ex < 1.0 or ey < 1.0 or ez < 1.0:
+                continue
+            if ex > 1e5 or ey > 1e5 or ez > 1e5:
+                continue
+            ox, oy, oz = floats[i], floats[i + 1], floats[i + 2]
+            if abs(ox) > 1e5 or abs(oy) > 1e5 or abs(oz) > 1e5:
+                continue
+            rad = floats[i + 6]
+            if rad != rad:
+                continue
+            mag = (ex * ex + ey * ey + ez * ez) ** 0.5
+            if mag < 1e-3:
+                continue
+            if abs(rad - mag) / mag < 0.01:
+                return (ox, oy, oz), (ex, ey, ez), rad
+
+    n2 = min(len(data) - 24, limit)
+    best = None
+    best_area = -1.0
+    for r in range(4):
+        usable = max(n2, 0) - r
+        nfloats = usable // 4
+        if nfloats < 6:
             continue
-        if ex > 1e5 or ey > 1e5 or ez > 1e5:
-            continue
-        if abs(ox) > 1e5 or abs(oy) > 1e5 or abs(oz) > 1e5:
-            continue
-        mag = (ex * ex + ey * ey + ez * ez) ** 0.5
-        if mag < 1e-3:
-            continue
-        if abs(r - mag) / mag < 0.01:
-            return (ox, oy, oz), (ex, ey, ez), r
-    return None
+        floats = _array("f")
+        floats.frombytes(data[r : r + nfloats * 4])
+        last_i = nfloats - 6
+        for i in range(0, last_i + 1):
+            minx, miny, minz = floats[i], floats[i + 1], floats[i + 2]
+            maxx, maxy, maxz = floats[i + 3], floats[i + 4], floats[i + 5]
+            if not (maxx >= minx and maxy >= miny and maxz >= minz):
+                continue
+            sx, sy, sz = maxx - minx, maxy - miny, maxz - minz
+            dims = sorted((sx, sy, sz))
+            if dims[1] < 500 or dims[2] > 1e6:
+                continue
+            area = dims[1] * dims[2]  # two largest dims
+            if area > best_area:
+                ex, ey, ez = sx / 2, sy / 2, sz / 2
+                origin = ((minx + maxx) / 2, (miny + maxy) / 2, (minz + maxz) / 2)
+                extent = (max(ex, 1.0), max(ey, 1.0), max(ez, 1.0))
+                radius = (ex * ex + ey * ey + ez * ez) ** 0.5
+                best = (origin, extent, radius)
+                best_area = area
+    return best
 
 
 def _sub(a, b):
@@ -420,6 +549,24 @@ def _valid_mesh(verts, indices):
     return True
 
 
+def _is_suspicious(verts, indices):
+    """A real indexed mesh with hundreds/thousands of vertices normally uses
+    most of them. A tiny index buffer (<=8 tris, <=10 unique verts touched)
+    carved out of a LARGE vertex buffer (>=50 verts) is the signature of a
+    coincidentally-valid few-index match sitting in front of the real index
+    buffer (or of the "vertex buffer" match itself being bogus) — seen in
+    practice on meshes like a "three" digit (1248 verts, only 6 referenced)
+    and custom map props (3632-14698 verts, only 3 referenced). Genuinely
+    tiny real meshes (e.g. a 12-vert flat collision plane) never trip this,
+    since the >=50-vert gate only applies to large buffers."""
+    if len(verts) < 50:
+        return False
+    tri_count = len(indices) // 3
+    if tri_count > 8:
+        return False
+    return len(set(indices)) <= 10
+
+
 def extract_geometry(
     raw: bytes,
     name: str = "StaticMesh",
@@ -443,26 +590,34 @@ def extract_geometry(
         except ValueError:
             pass
 
+    weak = None  # (MeshGeometry) — a suspicious-but-technically-valid match, kept only if nothing better turns up
+
     best = find_best_vs(raw, scan_from)
     if best:
         verts, vend, note, vstart = best
         ib = find_ib(raw, vend, len(verts), len(verts) - 1)
         if ib and _valid_mesh(verts, ib[0]):
-            return MeshGeometry(
+            geo = MeshGeometry(
                 name=name, vertices=verts, indices=ib[0],
                 source_offset=vstart, source_size=ib[1] - vstart,
                 notes=f"{note} | {ib[2]}",
             )
+            if not _is_suspicious(verts, ib[0]):
+                return geo
+            weak = geo
 
     loose = find_loose(raw)
     if loose:
         verts, vend, note, vstart, indices, idx_end, idx_note = loose
         if _valid_mesh(verts, indices):
-            return MeshGeometry(
+            geo = MeshGeometry(
                 name=name, vertices=verts, indices=indices,
                 source_offset=vstart, source_size=idx_end - vstart,
                 notes=f"{note} | {idx_note}",
             )
+            if not _is_suspicious(verts, indices):
+                return geo
+            weak = weak or geo
 
     # extended window from package (bulk after export)
     if package_data is not None and serial_offset >= 0:
@@ -474,11 +629,14 @@ def extract_geometry(
                 verts, vend, note, vstart = best
                 ib = find_ib(extended, vend, len(verts), len(verts) - 1)
                 if ib and _valid_mesh(verts, ib[0]):
-                    return MeshGeometry(
+                    geo = MeshGeometry(
                         name=name, vertices=verts, indices=ib[0],
                         source_offset=vstart, source_size=ib[1] - vstart,
                         notes=f"{note} | {ib[2]} | extended",
                     )
+                    if not _is_suspicious(verts, ib[0]):
+                        return geo
+                    weak = weak or geo
 
     # Legacy raw-triangle fallback (custom/modded meshes exported through a
     # different serialization path than the LOD render data the other
@@ -488,11 +646,22 @@ def extract_geometry(
     if bounds:
         verts, indices = find_triangle_soup(raw, scan_from, bounds)
         if _valid_mesh(verts, indices):
-            return MeshGeometry(
+            geo = MeshGeometry(
                 name=name, vertices=verts, indices=indices,
                 source_offset=scan_from, source_size=len(raw) - scan_from,
                 notes=f"legacy raw-triangle soup n_tris={len(indices)//3}",
             )
+            # triangle-soup candidates are inherently more trustworthy (every
+            # triangle is independently validated against the mesh's own
+            # bounds), so accept even a small one over a suspicious VS/IB hit
+            return geo
+
+    # Nothing fully convincing turned up. A suspicious-but-technically-valid
+    # match beats a hole in the map — return it, clearly flagged, rather than
+    # failing outright.
+    if weak is not None:
+        weak.notes = f"LOW-CONFIDENCE (tiny index buffer, likely incomplete) | {weak.notes}"
+        return weak
 
     raise ValueError(
         f"StaticMesh '{name}': no se encontró geometría válida "
