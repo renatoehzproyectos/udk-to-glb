@@ -32,6 +32,17 @@ from typing import List, Tuple, Optional
 UE3_TAG = 0x9E2A83C1
 
 
+def _fname_to_str(names: List[str], name_idx: int, name_num: int) -> str:
+    """Unreal's real string form of an FName: base name, plus '_<N-1>' when
+    name_num > 0 (instance number for the 2nd+ object sharing that base
+    name — e.g. 'DynamicMeshActor_TA', 'DynamicMeshActor_TA_1', ...). We
+    were reading name_num and then discarding it, so every instance of the
+    same base name collapsed to one identical string — losing hundreds of
+    distinct actor placements to that collision downstream."""
+    base = names[name_idx]
+    return f"{base}_{name_num - 1}" if name_num > 0 else base
+
+
 def read_fstring(data: bytes, off: int) -> Tuple[str, int]:
     """Lee un FString de Unreal (ASCII o UTF-16 según el signo del contador)."""
     n, = struct.unpack_from("<i", data, off)
@@ -233,7 +244,7 @@ class UnrealPackage:
                 class_package=self.names[class_pkg_idx],
                 class_name=self.names[class_idx],
                 outer_index=outer_index,
-                object_name=self.names[obj_idx],
+                object_name=_fname_to_str(self.names, obj_idx, obj_num),
             ))
         self.imports = imports
         expected_end = self.summary.export_offset
@@ -269,7 +280,7 @@ class UnrealPackage:
                 class_index=class_index,
                 super_index=super_index,
                 outer_index=outer_index,
-                object_name=self.names[name_idx],
+                object_name=_fname_to_str(self.names, name_idx, name_num),
                 archetype_index=archetype_index,
                 object_flags=object_flags,
                 serial_size=serial_size,

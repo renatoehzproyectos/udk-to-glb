@@ -97,9 +97,7 @@ def _read_f3(data, off, count, stride=12, floats=None):
         xs = [v[0] for v in verts]
         ys = [v[1] for v in verts]
         zs = [v[2] for v in verts]
-        if (max(xs) - min(xs) < 1e-4 and max(ys) - min(ys) < 1e-4 and max(zs) - min(zs) < 1e-4):
-            return None
-        if max(abs(v) for v in xs + ys + zs) < 1e-3:
+        if (max(xs) - min(xs) < 1e-5 and max(ys) - min(ys) < 1e-5 and max(zs) - min(zs) < 1e-5):
             return None
     return verts
 
@@ -129,17 +127,6 @@ def _read_f3_half(data, off, count):
         if not _f_ok(x, y, z):
             return None
         verts.append((x, y, z))
-    # Reject near-zero / constant clouds (common false positive from half-float
-    # bulk that is actually UV/color data or padding).
-    if count >= 6:
-        xs = [v[0] for v in verts]
-        ys = [v[1] for v in verts]
-        zs = [v[2] for v in verts]
-        if (max(xs) - min(xs) < 1e-4 and max(ys) - min(ys) < 1e-4 and max(zs) - min(zs) < 1e-4):
-            return None
-        # also reject if absolute scale is microscopic
-        if max(abs(v) for v in xs + ys + zs) < 1e-3:
-            return None
     return verts
 
 
@@ -643,10 +630,6 @@ def _valid_mesh(verts, indices):
     if len(verts) < 8 or len(indices) < 3:
         return False
     if len(indices) % 3:
-        return False
-    # reject completely degenerate index buffers (all zeros / single value)
-    uniq = set(indices)
-    if len(uniq) < 3:
         return False
     return True
 
