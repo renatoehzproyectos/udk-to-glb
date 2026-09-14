@@ -51,25 +51,66 @@ def main() -> None:
         for n, err in failed[:10]:
             print(f"  {n}: {err}")
         sys.exit(1)
+    # Classify meshes by bbox extent: world-space verts already correct at origin,
+    # local-space need instance transforms, degenerate geometry is dropped.
+    def _extent(verts):
+        if not verts:
+            return 0.0
+        xs = [v[0] for v in verts]; ys = [v[1] for v in verts]; zs = [v[2] for v in verts]
+        return max(max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs))
+
+    world_space = set()
+    local_space = set()
+    degenerate = set()
+    for mname, (verts, idxs) in list(meshes.items()):
+        ext = _extent(verts)
+        if ext < 1e-3 or (idxs and max(idxs) == 0):
+            degenerate.add(mname)
+            del meshes[mname]
+        elif ext > 400:
+            world_space.add(mname)
+        else:
+            local_space.add(mname)
+    print(f"Mesh classification: world={len(world_space)} local={len(local_space)} dropped_degenerate={len(degenerate)}")
+    if degenerate:
+        print(f"  dropped: {sorted(degenerate)}")
+
     nodes = []
     if not args.skip_actors:
+        from unreal.actors import extract_level_position_candidates
         actors = collect_placements(pkg)
         print(f"Actor placements: {len(actors)}")
-        used = set()
-        for a in actors:
-            if a.mesh_name and a.mesh_name in meshes:
-                nodes.append({"name": a.name, "mesh": a.mesh_name,
-                              "translation": a.location, "euler": a.rotation, "scale": a.scale})
-                used.add(a.mesh_name)
-        for mname in meshes:
-            if mname not in used:
-                nodes.append({"name": mname, "mesh": mname, "translation": (0, 0, 0)})
+        cands = extract_level_position_candidates(pkg)
+        print(f"Level position candidates: {len(cands)}")
+        cand_i = 0
+        used_meshes = set()
+        # World-space meshes: single node at origin (vertices already in place)
+        for mname in sorted(world_space):
+            nodes.append({"name": mname, "mesh": mname, "translation": (0.0, 0.0, 0.0)})
+            used_meshes.add(mname)
+        # Local-space meshes: instance with Level candidates
+        local_instances = [a for a in actors if a.mesh_name in local_space]
+        if not local_instances:
+            for mname in sorted(local_space):
+                nodes.append({"name": mname, "mesh": mname, "translation": (0.0, 0.0, 0.0)})
+        else:
+            for a in local_instances:
+                loc = a.location
+                if loc == (0.0, 0.0, 0.0) and cand_i < len(cands):
+                    loc = cands[cand_i]
+                    cand_i += 1
+                nodes.append({"name": f"{a.mesh_name}_{a.export_index}", "mesh": a.mesh_name,
+                              "translation": loc, "euler": a.rotation, "scale": a.scale})
+                used_meshes.add(a.mesh_name)
+            for mname in local_space:
+                if mname not in used_meshes:
+                    nodes.append({"name": mname, "mesh": mname, "translation": (0.0, 0.0, 0.0)})
     else:
         for mname in meshes:
             nodes.append({"name": mname, "mesh": mname})
     write_scene_glb(args.out, meshes, nodes)
     print(f"GLB: {args.out} ({os.path.getsize(args.out)} bytes)")
-    print(f"  meshes_ok={len(meshes)} nodes={len(nodes)} failed={len(failed)}")
+    print(f"  meshes_ok={len(meshes)} nodes={len(nodes)} failed={len(failed)} world={len(world_space)} local={len(local_space)}")
 
 if __name__ == "__main__":
     main()
