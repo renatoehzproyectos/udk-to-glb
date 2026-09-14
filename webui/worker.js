@@ -61,6 +61,7 @@ async def run(zip_bytes, say, progress):
     await asyncio.sleep(0)
 
     meshes = {}
+    lowconf_meshes = set()
     failed = []
     total = len(mesh_exports)
     for i, e in enumerate(mesh_exports):
@@ -71,7 +72,10 @@ async def run(zip_bytes, say, progress):
                                     ar_ver=pkg.summary.version,
                                     package_data=pkg.data, serial_offset=e.serial_offset)
             meshes[e.object_name] = (geo.vertices, geo.indices)
-            tag = "LOWCONF" if "LOW-CONFIDENCE" in geo.notes else "OK  "
+            is_lowconf = "LOW-CONFIDENCE" in geo.notes
+            if is_lowconf:
+                lowconf_meshes.add(e.object_name)
+            tag = "LOWCONF" if is_lowconf else "OK  "
             say(f"  {tag} {e.object_name}: {len(geo.vertices)} verts, {len(geo.indices)//3} tris")
         except ValueError as ex:
             failed.append((e.object_name, str(ex)))
@@ -81,6 +85,10 @@ async def run(zip_bytes, say, progress):
 
     if not meshes:
         raise ValueError("No StaticMesh geometry could be extracted")
+    if lowconf_meshes:
+        say(f"  Excluding {len(lowconf_meshes)} low-confidence mesh(es) from the 3D scene "
+            f"(kept in the log above, but their geometry is a weak/likely-wrong guess — "
+            f"showing it tends to look worse than leaving a gap): {', '.join(sorted(lowconf_meshes))}")
 
     nodes = []
     try:
@@ -88,17 +96,18 @@ async def run(zip_bytes, say, progress):
         say(f"Actor placements: {len(actors)}")
         used = set()
         for a in actors:
-            if a.mesh_name and a.mesh_name in meshes:
+            if a.mesh_name and a.mesh_name in meshes and a.mesh_name not in lowconf_meshes:
                 nodes.append({"name": a.name, "mesh": a.mesh_name,
                               "translation": a.location, "euler": a.rotation, "scale": a.scale})
                 used.add(a.mesh_name)
         for mname in meshes:
-            if mname not in used:
+            if mname not in used and mname not in lowconf_meshes:
                 nodes.append({"name": mname, "mesh": mname, "translation": (0, 0, 0)})
     except Exception:
         say("Actor placement parsing failed, placing meshes at origin.")
         for mname in meshes:
-            nodes.append({"name": mname, "mesh": mname, "translation": (0, 0, 0)})
+            if mname not in lowconf_meshes:
+                nodes.append({"name": mname, "mesh": mname, "translation": (0, 0, 0)})
 
     await asyncio.sleep(0)
     base_name = udk_name.rsplit('/', 1)[-1]

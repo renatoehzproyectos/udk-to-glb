@@ -15,6 +15,28 @@ from typing import List, Sequence, Tuple, Dict, Any
 from .writer import _align4
 
 
+def _mesh_color(name: str) -> Tuple[float, float, float]:
+    """Deterministic, well-separated color per mesh name — this map has no
+    real texture data (albedo textures live in other packages this file
+    only references, not embedded here), so distinct flat colors per mesh
+    are the honest substitute for 'can I tell parts apart'. Hash-based hue
+    keeps it stable across re-exports (same mesh name -> same color) and
+    golden-angle spacing keeps adjacent hashes from landing on similar hues."""
+    h = (hash(name) % 100000) * 0.6180339887498949  # golden angle walk
+    h = h - math.floor(h)
+    s, v = 0.55, 0.85
+    i = int(h * 6)
+    f = h * 6 - i
+    p = v * (1 - s)
+    q = v * (1 - s * f)
+    t = v * (1 - s * (1 - f))
+    r, g, b = [
+        (v, t, p), (q, v, p), (p, v, t),
+        (p, q, v), (t, p, v), (v, p, q),
+    ][i % 6]
+    return (r, g, b)
+
+
 def _euler_unreal_to_quat(pitch: float, yaw: float, roll: float) -> Tuple[float, float, float, float]:
     """
     Aproximación: Unreal Rotator en grados → quaternion (x,y,z,w).
@@ -57,6 +79,7 @@ def write_scene_glb(
     accessors = []
     buffer_views = []
     gltf_meshes = []
+    gltf_materials = []
     mesh_index = {}
 
     byte_offset = 0
@@ -103,9 +126,20 @@ def write_scene_glb(
         byte_offset += len(idx_data) + len(idx_pad)
 
         mesh_index[mname] = len(gltf_meshes)
+        r, g, b = _mesh_color(mname)
+        mat_index = len(gltf_materials)
+        gltf_materials.append({
+            "name": f"mat_{mname}",
+            "pbrMetallicRoughness": {
+                "baseColorFactor": [r, g, b, 1.0],
+                "metallicFactor": 0.0,
+                "roughnessFactor": 0.85,
+            },
+        })
         gltf_meshes.append({
             "name": mname,
-            "primitives": [{"attributes": {"POSITION": acc_pos}, "indices": acc_idx, "mode": 4}],
+            "primitives": [{"attributes": {"POSITION": acc_pos}, "indices": acc_idx,
+                             "mode": 4, "material": mat_index}],
         })
 
     gltf_nodes = []
@@ -135,6 +169,7 @@ def write_scene_glb(
         "bufferViews": buffer_views,
         "accessors": accessors,
         "meshes": gltf_meshes,
+        "materials": gltf_materials,
         "nodes": gltf_nodes,
         "scenes": [{"nodes": root_children}],
         "scene": 0,
