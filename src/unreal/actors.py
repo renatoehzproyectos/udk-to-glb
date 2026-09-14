@@ -39,11 +39,17 @@ def _read_vector(data: bytes, off: int) -> Tuple[Tuple[float, float, float], int
 
 
 def _read_rotator(data: bytes, off: int) -> Tuple[Tuple[float, float, float], int]:
-    """FRotator: Pitch, Yaw, Roll as float (UE3 often stores as float degrees*...)."""
+    """FRotator is serialized as 3 INT32 Unreal Rotation Units (65536 units
+    = 360 degrees) — NOT floats. Reading them as floats reinterprets integer
+    bit patterns as float bits, which is garbage (often literal NaN) for any
+    real rotation value; confirmed against real data where bytes that decode
+    cleanly as int3 (0, -32768, 0) — an exact, sensible -180 degrees —
+    decode as (0.0, nan, 0.0) when misread as floats. Returns degrees."""
     if off + 12 > len(data):
         raise ValueError(f"EOF Rotator @{off}")
-    p, y, r = struct.unpack_from("<fff", data, off)
-    return (p, y, r), off + 12
+    p, y, r = struct.unpack_from("<iii", data, off)
+    to_deg = 360.0 / 65536.0
+    return (p * to_deg, y * to_deg, r * to_deg), off + 12
 
 
 def _read_object_index(data: bytes, off: int) -> Tuple[int, int]:
